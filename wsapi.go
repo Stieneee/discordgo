@@ -13,6 +13,7 @@ package discordgo
 import (
 	"bytes"
 	"compress/zlib"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -726,30 +727,73 @@ func (s *Session) ChannelVoiceJoin(gID, cID string, mute, deaf bool) (voice *Voi
 	voice, _ = s.VoiceConnections[gID]
 	s.RUnlock()
 
+	// Check if existing connection is stale (context cancelled)
+	if voice != nil {
+		select {
+		case <-voice.ctx.Done():
+			// Connection is stale, clean it up
+			s.log(LogInformational, "cleaning up stale voice connection for guild %s", gID)
+			s.Lock()
+			delete(s.VoiceConnections, gID)
+			s.Unlock()
+
+			// Force disconnect via main gateway to clear Discord's server-side state
+			// This ensures Discord will send fresh VOICE_STATE_UPDATE and VOICE_SERVER_UPDATE
+			// events when we rejoin, rather than ignoring us as "already connected"
+			if err = s.forceVoiceDisconnect(gID); err != nil {
+				s.log(LogWarning, "error forcing voice disconnect: %s", err)
+			}
+			time.Sleep(500 * time.Millisecond)
+
+			voice = nil
+		default:
+			// Connection is still alive
+		}
+	}
+
 	if voice == nil {
-		voice = &VoiceConnection{}
+		// Create new VoiceConnection with command queue pattern
+		ctx, cancel := context.WithCancel(context.Background())
+		voice = &VoiceConnection{
+			cmds:      make(chan voiceCmd, 100),
+			ctx:       ctx,
+			cancel:    cancel,
+			GuildID:   gID,
+			ChannelID: cID,
+			session:   s,
+		}
+
+		// Create initial state and start owner goroutine
+		state := &voiceState{
+			deaf: deaf,
+			mute: mute,
+		}
+		go voice.runOwner(state)
+
 		s.Lock()
 		s.VoiceConnections[gID] = voice
 		s.Unlock()
+	} else {
+		// Update existing connection
+		voice.ChannelID = cID
+		voice.DoVoice(func(s *voiceState) {
+			s.deaf = deaf
+			s.mute = mute
+		})
 	}
-
-	voice.Lock()
-	voice.GuildID = gID
-	voice.ChannelID = cID
-	voice.deaf = deaf
-	voice.mute = mute
-	voice.session = s
-	voice.Unlock()
 
 	err = s.ChannelVoiceJoinManual(gID, cID, mute, deaf)
 	if err != nil {
 		return
 	}
 
-	// doesn't exactly work perfect yet.. TODO
+	// Wait for connection to be ready
 	err = voice.waitUntilConnected()
 	if err != nil {
 		s.log(LogWarning, "error waiting for voice to connect, %s", err)
+		// Force disconnect via gateway to clear Discord's server-side state
+		// This ensures next join attempt gets fresh VOICE_STATE_UPDATE/VOICE_SERVER_UPDATE
+		s.forceVoiceDisconnect(gID)
 		voice.Close()
 		return
 	}
@@ -769,6 +813,31 @@ func (s *Session) ChannelVoiceJoinManual(gID, cID string, mute, deaf bool) (err 
 
 	s.log(LogInformational, "called")
 
+	// Check if main gateway is connected and ready
+	if s.wsConn == nil {
+		return fmt.Errorf("main gateway websocket not connected")
+	}
+	if !s.DataReady {
+		return fmt.Errorf("main gateway not ready (DataReady=false)")
+	}
+
+	// Always send disconnect first to clear any stale server-side state
+	// This ensures Discord sends fresh VOICE_STATE_UPDATE and VOICE_SERVER_UPDATE
+	// events, even if Discord thinks we're already in the channel (e.g., after
+	// network outage where we couldn't send a proper disconnect)
+	disconnectData := voiceChannelJoinOp{4, voiceChannelJoinData{&gID, nil, true, true}}
+	s.wsMutex.Lock()
+	s.wsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	err = s.wsConn.WriteJSON(disconnectData)
+	s.wsConn.SetWriteDeadline(time.Time{}) // Clear deadline
+	s.wsMutex.Unlock()
+	if err != nil {
+		return fmt.Errorf("error sending disconnect: %w", err)
+	}
+
+	// Brief wait for Discord to process the disconnect
+	time.Sleep(200 * time.Millisecond)
+
 	var channelID *string
 	if cID == "" {
 		channelID = nil
@@ -776,12 +845,32 @@ func (s *Session) ChannelVoiceJoinManual(gID, cID string, mute, deaf bool) (err 
 		channelID = &cID
 	}
 
-	// Send the request to Discord that we want to join the voice channel
+	// Now send the join request
 	data := voiceChannelJoinOp{4, voiceChannelJoinData{&gID, channelID, mute, deaf}}
 	s.wsMutex.Lock()
+	s.wsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	err = s.wsConn.WriteJSON(data)
+	s.wsConn.SetWriteDeadline(time.Time{}) // Clear deadline
 	s.wsMutex.Unlock()
 	return
+}
+
+// forceVoiceDisconnect sends a disconnect packet to Discord's main gateway
+// to clear our voice state. This is needed when reconnecting after network
+// outages, as Discord may still think we're in the channel.
+func (s *Session) forceVoiceDisconnect(gID string) error {
+	s.log(LogInformational, "forcing voice disconnect for guild %s", gID)
+	if s.wsConn == nil {
+		s.log(LogWarning, "cannot force voice disconnect: main gateway not connected")
+		return fmt.Errorf("main gateway websocket not connected")
+	}
+	data := voiceChannelJoinOp{4, voiceChannelJoinData{&gID, nil, true, true}}
+	s.wsMutex.Lock()
+	s.wsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	err := s.wsConn.WriteJSON(data)
+	s.wsConn.SetWriteDeadline(time.Time{}) // Clear deadline
+	s.wsMutex.Unlock()
+	return err
 }
 
 // onVoiceStateUpdate handles Voice State Update events on the data websocket.
@@ -805,12 +894,14 @@ func (s *Session) onVoiceStateUpdate(st *VoiceStateUpdate) {
 		return
 	}
 
-	// Store the SessionID for later use.
-	voice.Lock()
+	// Update immutable fields directly (safe - set before goroutines start)
 	voice.UserID = st.UserID
-	voice.sessionID = st.SessionID
 	voice.ChannelID = st.ChannelID
-	voice.Unlock()
+
+	// Store the SessionID via command queue
+	voice.DoVoice(func(state *voiceState) {
+		state.sessionID = st.SessionID
+	})
 }
 
 // onVoiceServerUpdate handles the Voice Server Update data websocket event.
@@ -831,16 +922,31 @@ func (s *Session) onVoiceServerUpdate(st *VoiceServerUpdate) {
 		return
 	}
 
-	// If currently connected to voice ws/udp, then disconnect.
-	// Has no effect if not connected.
-	voice.Close()
+	// Store values for later use via command queue
+	voice.DoVoice(func(state *voiceState) {
+		// Close any existing connections first
+		if state.close != nil {
+			close(state.close)
+			state.close = nil
+		}
+		if state.udpConn != nil {
+			state.udpConn.Close()
+			state.udpConn = nil
+		}
+		if state.wsConn != nil {
+			state.wsConn.Close()
+			state.wsConn = nil
+		}
+		state.ready = false
+		state.speaking = false
 
-	// Store values for later use
-	voice.Lock()
-	voice.token = st.Token
-	voice.endpoint = st.Endpoint
+		// Store new values
+		state.token = st.Token
+		state.endpoint = st.Endpoint
+	})
+
+	// Update GuildID on connection (immutable)
 	voice.GuildID = st.GuildID
-	voice.Unlock()
 
 	// Open a connection to the voice server
 	err := voice.open()
