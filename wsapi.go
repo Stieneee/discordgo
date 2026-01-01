@@ -755,18 +755,18 @@ func (s *Session) ChannelVoiceJoin(gID, cID string, mute, deaf bool) (voice *Voi
 		// Create new VoiceConnection with command queue pattern
 		ctx, cancel := context.WithCancel(context.Background())
 		voice = &VoiceConnection{
-			cmds:      make(chan voiceCmd, 100),
-			ctx:       ctx,
-			cancel:    cancel,
-			GuildID:   gID,
-			ChannelID: cID,
-			session:   s,
+			cmds:    make(chan voiceCmd, 100),
+			ctx:     ctx,
+			cancel:  cancel,
+			GuildID: gID,
+			session: s,
 		}
 
 		// Create initial state and start owner goroutine
 		state := &voiceState{
-			deaf: deaf,
-			mute: mute,
+			channelID: cID,
+			deaf:      deaf,
+			mute:      mute,
 		}
 		go voice.runOwner(state)
 
@@ -775,8 +775,8 @@ func (s *Session) ChannelVoiceJoin(gID, cID string, mute, deaf bool) (voice *Voi
 		s.Unlock()
 	} else {
 		// Update existing connection
-		voice.ChannelID = cID
 		voice.DoVoice(func(s *voiceState) {
+			s.channelID = cID
 			s.deaf = deaf
 			s.mute = mute
 		})
@@ -894,12 +894,12 @@ func (s *Session) onVoiceStateUpdate(st *VoiceStateUpdate) {
 		return
 	}
 
-	// Update immutable fields directly (safe - set before goroutines start)
+	// UserID is truly immutable (same value - bot's user ID)
 	voice.UserID = st.UserID
-	voice.ChannelID = st.ChannelID
 
-	// Store the SessionID via command queue
+	// Update mutable state via command queue
 	voice.DoVoice(func(state *voiceState) {
+		state.channelID = st.ChannelID
 		state.sessionID = st.SessionID
 	})
 }

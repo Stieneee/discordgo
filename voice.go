@@ -38,6 +38,9 @@ type voiceState struct {
 	mute         bool
 	reconnecting bool
 
+	// channelID is the current voice channel - mutable, updated on channel changes
+	channelID string
+
 	wsConn  *websocket.Conn
 	wsMutex sync.Mutex // Serialize websocket writes
 	udpConn *net.UDPConn
@@ -79,7 +82,6 @@ type VoiceConnection struct {
 	LogLevel int
 	UserID   string
 	GuildID  string
-	ChannelID string
 	session  *Session
 }
 
@@ -223,6 +225,15 @@ func (v *VoiceConnection) Ready() bool {
 	return ready
 }
 
+// GetChannelID returns the current channel ID (thread-safe read via command).
+func (v *VoiceConnection) GetChannelID() string {
+	var channelID string
+	v.DoVoice(func(s *voiceState) {
+		channelID = s.channelID
+	})
+	return channelID
+}
+
 // Speaking sends a speaking notification to Discord over the voice websocket.
 // This must be sent as true prior to sending audio and should be set to false
 // once finished sending audio.
@@ -282,11 +293,9 @@ func (v *VoiceConnection) ChangeChannel(channelID string, mute, deaf bool) (err 
 		return
 	}
 
-	// Update ChannelID on the connection (immutable field update - safe)
-	v.ChannelID = channelID
-
 	// Update mutable state via command
 	v.DoVoice(func(s *voiceState) {
+		s.channelID = channelID
 		s.deaf = deaf
 		s.mute = mute
 		s.speaking = false
@@ -1098,11 +1107,13 @@ func (v *VoiceConnection) reconnect() {
 		return
 	}
 
-	// Get mute/deaf state BEFORE closing - DoVoice fails after Close() cancels context
+	// Get mute/deaf/channelID state BEFORE closing - DoVoice fails after Close() cancels context
 	var mute, deaf bool
+	var channelID string
 	v.DoVoice(func(s *voiceState) {
 		mute = s.mute
 		deaf = s.deaf
+		channelID = s.channelID
 	})
 
 	// Close current connections (cancels context, making DoVoice no longer work)
@@ -1129,15 +1140,15 @@ func (v *VoiceConnection) reconnect() {
 			continue
 		}
 
-		v.log(LogInformational, "trying to reconnect to channel %s", v.ChannelID)
+		v.log(LogInformational, "trying to reconnect to channel %s", channelID)
 
-		_, err := v.session.ChannelVoiceJoin(v.GuildID, v.ChannelID, mute, deaf)
+		_, err := v.session.ChannelVoiceJoin(v.GuildID, channelID, mute, deaf)
 		if err == nil {
-			v.log(LogInformational, "successfully reconnected to channel %s", v.ChannelID)
+			v.log(LogInformational, "successfully reconnected to channel %s", channelID)
 			return
 		}
 
-		v.log(LogInformational, "error reconnecting to channel %s, %s", v.ChannelID, err)
+		v.log(LogInformational, "error reconnecting to channel %s, %s", channelID, err)
 
 		// Send disconnect packet to reset
 		data := voiceChannelJoinOp{4, voiceChannelJoinData{&v.GuildID, nil, true, true}}
