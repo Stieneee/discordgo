@@ -813,11 +813,16 @@ func (s *Session) ChannelVoiceJoinManual(gID, cID string, mute, deaf bool) (err 
 
 	s.log(LogInformational, "called")
 
-	// Check if main gateway is connected and ready
-	if s.wsConn == nil {
+	// Check if main gateway is connected and ready (thread-safe read)
+	s.RLock()
+	wsConn := s.wsConn
+	dataReady := s.DataReady
+	s.RUnlock()
+
+	if wsConn == nil {
 		return fmt.Errorf("main gateway websocket not connected")
 	}
-	if !s.DataReady {
+	if !dataReady {
 		return fmt.Errorf("main gateway not ready (DataReady=false)")
 	}
 
@@ -827,9 +832,9 @@ func (s *Session) ChannelVoiceJoinManual(gID, cID string, mute, deaf bool) (err 
 	// network outage where we couldn't send a proper disconnect)
 	disconnectData := voiceChannelJoinOp{4, voiceChannelJoinData{&gID, nil, true, true}}
 	s.wsMutex.Lock()
-	s.wsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	err = s.wsConn.WriteJSON(disconnectData)
-	s.wsConn.SetWriteDeadline(time.Time{}) // Clear deadline
+	wsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	err = wsConn.WriteJSON(disconnectData)
+	wsConn.SetWriteDeadline(time.Time{}) // Clear deadline
 	s.wsMutex.Unlock()
 	if err != nil {
 		return fmt.Errorf("error sending disconnect: %w", err)
@@ -848,9 +853,9 @@ func (s *Session) ChannelVoiceJoinManual(gID, cID string, mute, deaf bool) (err 
 	// Now send the join request
 	data := voiceChannelJoinOp{4, voiceChannelJoinData{&gID, channelID, mute, deaf}}
 	s.wsMutex.Lock()
-	s.wsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	err = s.wsConn.WriteJSON(data)
-	s.wsConn.SetWriteDeadline(time.Time{}) // Clear deadline
+	wsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	err = wsConn.WriteJSON(data)
+	wsConn.SetWriteDeadline(time.Time{}) // Clear deadline
 	s.wsMutex.Unlock()
 	return
 }
