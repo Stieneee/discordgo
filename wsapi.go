@@ -860,15 +860,20 @@ func (s *Session) ChannelVoiceJoinManual(gID, cID string, mute, deaf bool) (err 
 // outages, as Discord may still think we're in the channel.
 func (s *Session) forceVoiceDisconnect(gID string) error {
 	s.log(LogInformational, "forcing voice disconnect for guild %s", gID)
-	if s.wsConn == nil {
+
+	s.RLock()
+	wsConn := s.wsConn
+	s.RUnlock()
+
+	if wsConn == nil {
 		s.log(LogWarning, "cannot force voice disconnect: main gateway not connected")
 		return fmt.Errorf("main gateway websocket not connected")
 	}
 	data := voiceChannelJoinOp{4, voiceChannelJoinData{&gID, nil, true, true}}
 	s.wsMutex.Lock()
-	s.wsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	err := s.wsConn.WriteJSON(data)
-	s.wsConn.SetWriteDeadline(time.Time{}) // Clear deadline
+	wsConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	err := wsConn.WriteJSON(data)
+	wsConn.SetWriteDeadline(time.Time{}) // Clear deadline
 	s.wsMutex.Unlock()
 	return err
 }
